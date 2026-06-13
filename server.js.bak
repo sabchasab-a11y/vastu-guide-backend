@@ -1,0 +1,342 @@
+require('dotenv').config();
+
+const express = require('express');
+const cors = require('cors');
+const { google } = require('googleapis');
+const Anthropic = require('@anthropic-ai/sdk');
+
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: '25mb' }));
+
+const PORT = process.env.PORT || 3000;
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+// ═══════════════════════════════════════════════════════════════
+// PROMPT BUILDERS — one per plan type
+// ═══════════════════════════════════════════════════════════════
+
+function buildFreePrompt(roomData) {
+  const rooms = [
+    roomData.entrance && `Main Entrance: faces ${roomData.entrance}`,
+    roomData.masterBedroom && `Master Bedroom: located in the ${roomData.masterBedroom} zone`,
+    roomData.bathroom && `Bathroom/Toilet: located in the ${roomData.bathroom} zone`,
+  ].filter(Boolean).join('\n');
+
+  return `You are a Vastu Shastra consultant. Provide a QUICK FREE TRIAL analysis focused on the 3 main areas.
+
+Property: ${roomData.propertyName || 'Residential Property'}
+Room placements:
+${rooms}
+
+Return ONLY a JSON object (no markdown, no preamble). Schema:
+{
+  "score": <0-100 integer>,
+  "grade": "<Good|Fair|Needs Attention>",
+  "propertyName": "${roomData.propertyName || 'My Home'}",
+  "overallSummary": "<2 sentences: quick summary of the 3-room Vastu status>",
+  "rooms": [
+    {
+      "room": "<Room name>",
+      "icon": "<emoji>",
+      "direction": "<direction>",
+      "status": "<good|caution|defect>",
+      "issues": [
+        { "problem": "<issue>", "remedy": "<brief remedy>" }
+      ]
+    }
+  ],
+  "issues": [
+    {
+      "zone": "<direction>",
+      "title": "<issue title>",
+      "description": "<brief description>",
+      "severity": "<major|minor>",
+      "remedy": "<brief remedy>"
+    }
+  ],
+  "recommendations": [
+    { "title": "<action>", "detail": "<instruction>" }
+  ]
+}
+
+Keep it concise. Focus on the 3 main areas only. Limit to top 3 issues.`;
+}
+
+function buildStandardPrompt(roomData) {
+  const rooms = [
+    roomData.entrance && `Main Entrance: faces ${roomData.entrance}`,
+    roomData.kitchen && `Kitchen: located in the ${roomData.kitchen} zone`,
+    roomData.masterBedroom && `Master Bedroom: located in the ${roomData.masterBedroom} zone`,
+    roomData.bathroom && `Bathroom/Toilet: located in the ${roomData.bathroom} zone`,
+    roomData.livingRoom && `Living Room: located in the ${roomData.livingRoom} zone`,
+    roomData.pooja && `Pooja Room: located in the ${roomData.pooja} zone`,
+  ].filter(Boolean).join('\n');
+
+  return `You are a certified Vastu Shastra consultant. Provide a STANDARD analysis that focuses on identifying problem areas.
+
+Property: ${roomData.propertyName || 'Residential Property'}
+Room placements:
+${rooms}
+
+Return ONLY a JSON object (no markdown, no preamble). Schema:
+{
+  "score": <0-100 integer>,
+  "grade": "<Excellent|Good|Fair|Needs Attention|Poor>",
+  "propertyName": "${roomData.propertyName || 'My Home'}",
+  "overallSummary": "<2 concise sentences summarizing the Vastu status>",
+  "rooms": [
+    {
+      "room": "<Room name>",
+      "icon": "<emoji>",
+      "direction": "<direction with Sanskrit name>",
+      "status": "<excellent|good|caution|defect>",
+      "issues": [
+        { "problem": "<specific Vastu violation>", "remedy": "<brief practical remedy>" }
+      ]
+    }
+  ],
+  "issues": [
+    {
+      "zone": "<direction zone>",
+      "title": "<issue title>",
+      "description": "<what is wrong and why it matters per Vastu>",
+      "severity": "<critical|major|minor>",
+      "remedy": "<brief remedy>"
+    }
+  ],
+  "strengths": [
+    { "title": "<strength>", "detail": "<why it is good per Vastu>" }
+  ],
+  "recommendations": [
+    { "title": "<action>", "detail": "<brief instruction>" }
+  ]
+}
+
+Limit to top 5 issues. Keep remedies brief. Focus on problems, not detailed narratives.`;
+}
+
+function buildDetailedPrompt(roomData) {
+  const rooms = [
+    roomData.entrance && `Main Entrance: faces ${roomData.entrance}`,
+    roomData.kitchen && `Kitchen: located in the ${roomData.kitchen} zone`,
+    roomData.masterBedroom && `Master Bedroom: located in the ${roomData.masterBedroom} zone`,
+    roomData.bathroom && `Bathroom/Toilet: located in the ${roomData.bathroom} zone`,
+    roomData.livingRoom && `Living Room: located in the ${roomData.livingRoom} zone`,
+    roomData.pooja && `Pooja Room: located in the ${roomData.pooja} zone`,
+  ].filter(Boolean).join('\n');
+
+  return `You are a senior Vastu Shastra expert with 30 years of practice. Provide a COMPREHENSIVE, DETAILED analysis.
+
+Property: ${roomData.propertyName || 'Residential Property'}
+Room placements:
+${rooms}
+
+Return ONLY a valid JSON object. Schema:
+{
+  "score": <0-100 integer>,
+  "grade": "<Excellent|Good|Fair|Needs Attention|Poor>",
+  "propertyName": "${roomData.propertyName || 'My Home'}",
+  "overallSummary": "<3-4 sentences: comprehensive overall assessment referencing Vastu principles>",
+  "elementMapping": {
+    "Earth (Prithvi)": { "icon": "🌍", "zone": "<primary zone>", "balanced": <true|false>, "note": "<assessment>" },
+    "Water (Jal)": { "icon": "💧", "zone": "<primary zone>", "balanced": <true|false>, "note": "<assessment>" },
+    "Fire (Agni)": { "icon": "🔥", "zone": "<primary zone>", "balanced": <true|false>, "note": "<assessment>" },
+    "Air (Vayu)": { "icon": "💨", "zone": "<primary zone>", "balanced": <true|false>, "note": "<assessment>" },
+    "Space (Akasha)": { "icon": "✨", "zone": "<primary zone>", "balanced": <true|false>, "note": "<assessment>" }
+  },
+  "rooms": [
+    {
+      "room": "<Room name>",
+      "icon": "<emoji>",
+      "direction": "<direction with Sanskrit name e.g. North-East (Ishanya)>",
+      "status": "<excellent|good|caution|defect>",
+      "summary": "<2-3 sentence detailed Vastu narrative for this room>",
+      "positives": ["<positive Vastu aspect>"],
+      "issues": [
+        {
+          "problem": "<specific Vastu violation with textual basis>",
+          "remedy": "<detailed, practical remedy including colours/materials/plants/crystals as appropriate>"
+        }
+      ]
+    }
+  ],
+  "issues": [
+    {
+      "zone": "<direction zone with Sanskrit name>",
+      "title": "<issue title>",
+      "description": "<detailed explanation of why this violates Vastu and what life areas it affects>",
+      "severity": "<critical|major|minor>",
+      "remedy": "<step-by-step practical remedy with specific materials, colours, or objects>"
+    }
+  ],
+  "strengths": [
+    { "title": "<strength>", "detail": "<detailed explanation referencing Vastu texts or principles>" }
+  ],
+  "recommendations": [
+    {
+      "title": "<action heading>",
+      "detail": "<detailed instruction with specific colours, plants, mirrors, crystals, or directional placements>",
+      "timing": "<auspicious time or condition e.g. Thursday morning, during Shukla Paksha>"
+    }
+  ]
+}
+
+Provide at least 5 items in rooms, 5 issues, 4 strengths, 6 recommendations. Be thorough and professional.`;
+}
+
+function buildFloorPlanPrompt(mimeType) {
+  return `You are a senior Vastu Shastra expert specializing in architectural analysis. Carefully examine this floor plan.
+
+This is an actual architectural floor plan. Analyze every visible element:
+- Room positions, shapes, and proportions
+- Entrance/door placements
+- Kitchen, bathroom, bedroom locations
+- Staircase position (if visible)
+- Plot shape (extensions, cuts)
+- Brahmasthan (center of the plot)
+- Open spaces and courtyards
+
+Return ONLY a valid JSON object. Schema:
+{
+  "score": <0-100 integer>,
+  "grade": "<Excellent|Good|Fair|Needs Attention|Poor>",
+  "propertyName": "Floor Plan Analysis",
+  "overallSummary": "<4-5 sentences: comprehensive architectural Vastu assessment>",
+  "elementMapping": {
+    "Earth (Prithvi)": { "icon": "🌍", "zone": "South-West (Nairutya)", "balanced": <true|false>, "note": "<assessment>" },
+    "Water (Jal)": { "icon": "💧", "zone": "North-East (Ishanya)", "balanced": <true|false>, "note": "<assessment>" },
+    "Fire (Agni)": { "icon": "🔥", "zone": "South-East (Agneya)", "balanced": <true|false>, "note": "<assessment>" },
+    "Air (Vayu)": { "icon": "💨", "zone": "North-West (Vayavya)", "balanced": <true|false>, "note": "<assessment>" },
+    "Space (Akasha)": { "icon": "✨", "zone": "Center (Brahmasthan)", "balanced": <true|false>, "note": "<assessment>" }
+  },
+  "rooms": [
+    {
+      "room": "<detected room>",
+      "icon": "<emoji>",
+      "direction": "<direction from center with Sanskrit name>",
+      "status": "<excellent|good|caution|defect>",
+      "summary": "<detailed Vastu analysis of this room's position, proportion, and placement>",
+      "positives": ["<positive>"],
+      "issues": [
+        { "problem": "<specific structural Vastu defect>", "remedy": "<detailed remedy>" }
+      ]
+    }
+  ],
+  "issues": [
+    {
+      "zone": "<zone>",
+      "title": "<title>",
+      "description": "<detailed explanation including structural impact>",
+      "severity": "<critical|major|minor>",
+      "remedy": "<detailed structural or non-structural remedy>"
+    }
+  ],
+  "strengths": [
+    { "title": "<strength>", "detail": "<explanation>" }
+  ],
+  "recommendations": [
+    {
+      "title": "<title>",
+      "detail": "<very specific instruction with measurements, colours, materials where applicable>",
+      "timing": "<auspicious timing>"
+    }
+  ]
+}
+
+Be extremely specific about what you see in the floor plan. Mention exact rooms, their positions, and precise Vastu violations or compliances.`;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// POST /api/analyze
+// ═══════════════════════════════════════════════════════════════
+app.post('/api/analyze', async (req, res) => {
+  const { planType, roomData, base64, mimeType } = req.body;
+
+  if (!planType) return res.status(400).json({ success: false, error: 'Missing planType' });
+
+  let messages;
+  let prompt;
+
+  if (planType === 'floorplan') {
+    if (!base64 || !mimeType) return res.status(400).json({ success: false, error: 'Missing floor plan file' });
+    const isPDF = mimeType === 'application/pdf';
+    const filePart = isPDF
+      ? { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: base64 } }
+      : { type: 'image', source: { type: 'base64', media_type: mimeType, data: base64 } };
+    prompt = buildFloorPlanPrompt(mimeType);
+    messages = [{ role: 'user', content: [filePart, { type: 'text', text: prompt }] }];
+  } else {
+    if (!roomData) return res.status(400).json({ success: false, error: 'Missing room data' });
+    if (planType === 'free') {
+      prompt = buildFreePrompt(roomData);
+    } else if (planType === 'standard') {
+      prompt = buildStandardPrompt(roomData);
+    } else {
+      prompt = buildDetailedPrompt(roomData);
+    }
+    messages = [{ role: 'user', content: prompt }];
+  }
+
+  try {
+    const response = await anthropic.messages.create({
+      model: 'claude-sonnet-3-5-20241022',
+      max_tokens: planType === 'free' ? 1500 : planType === 'standard' ? 3000 : 5000,
+      system: 'You are a Vastu Shastra expert consultant. Respond ONLY with a valid JSON object. No markdown fences, no preamble, no explanation. Start with { and end with }.',
+      messages,
+    });
+
+    const raw = response.content.filter(b => b.type === 'text').map(b => b.text).join('');
+
+    let parsed;
+    try { parsed = JSON.parse(raw.trim()); }
+    catch {
+      try { parsed = JSON.parse(raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim()); }
+      catch {
+        const match = raw.match(/\{[\s\S]*\}/);
+        if (!match) throw new Error('No JSON found in response');
+        parsed = JSON.parse(match[0]);
+      }
+    }
+
+    res.json({ success: true, result: parsed });
+  } catch (err) {
+    console.error('Analysis error:', err.message);
+    res.status(500).json({ success: false, error: err.message || 'Analysis failed' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// POST /api/verify-purchase
+// ═══════════════════════════════════════════════════════════════
+app.post('/api/verify-purchase', async (req, res) => {
+  const { productId, purchaseToken, packageName } = req.body;
+  if (!productId || !purchaseToken || !packageName) {
+    return res.status(400).json({ success: false, error: 'Missing purchase details' });
+  }
+
+  try {
+    const serviceAccount = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
+    const auth = new google.auth.GoogleAuth({
+      credentials: serviceAccount,
+      scopes: ['https://www.googleapis.com/auth/androidpublisher'],
+    });
+    const publisher = google.androidpublisher({ version: 'v3', auth });
+
+    const { data: purchase } = await publisher.purchases.products.get({ packageName, productId, token: purchaseToken });
+
+    if (purchase.purchaseState !== 0) return res.status(400).json({ success: false, error: 'Purchase not completed' });
+    if (purchase.consumptionState !== 0) return res.status(400).json({ success: false, error: 'Already consumed' });
+
+    await publisher.purchases.products.acknowledge({ packageName, productId, token: purchaseToken });
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Verify error:', err.message);
+    res.status(500).json({ success: false, error: 'Purchase verification failed' });
+  }
+});
+
+app.get('/health', (req, res) => res.json({ status: 'ok', version: '2.0' }));
+
+app.listen(PORT, () => console.log(`Vastu Guide v2 backend on port ${PORT}`));
