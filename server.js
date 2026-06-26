@@ -7,14 +7,81 @@ const Anthropic = require('@anthropic-ai/sdk');
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '25mb' }));
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ limit: '10mb', extended: true }));
+app.use(express.raw({ type: 'image/*', limit: '10mb' }));
+app.use(express.raw({ type: 'application/pdf', limit: '10mb' }));
 
 const PORT = process.env.PORT || 3000;
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-// ═══════════════════════════════════════════════════════════════
-// PROMPT BUILDERS — one per plan type
-// ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
+// PAYMENT VERIFICATION (Check if user has valid purchase)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+async function verifyPurchaseValid(productId, purchaseToken, packageName) {
+  try {
+    if (!purchaseToken || purchaseToken === 'free') {
+      return { isPaid: false, isValid: true }; // Free plan - no verification needed
+    }
+
+    const serviceAccount = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
+    const auth = new google.auth.GoogleAuth({
+      credentials: serviceAccount,
+      scopes: ['https://www.googleapis.com/auth/androidpublisher'],
+    });
+    const publisher = google.androidpublisher({ version: 'v3', auth });
+
+    const { data: purchase } = await publisher.purchases.products.get({ 
+      packageName, 
+      productId, 
+      token: purchaseToken 
+    });
+
+    // Check if purchase is valid and not consumed
+    const isValid = purchase.purchaseState === 0 && purchase.consumptionState === 0;
+    
+    return { isPaid: isValid, isValid };
+  } catch (err) {
+    console.error('Purchase verification error:', err.message);
+    return { isPaid: false, isValid: false };
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PLAN LIMITS - Enforce what each plan can do
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const PLAN_LIMITS = {
+  free: {
+    maxRooms: 3,
+    maxIssues: 3,
+    maxRecommendations: 2,
+    allowFloorPlan: false,
+  },
+  standard: {
+    maxRooms: 6,
+    maxIssues: 5,
+    maxRecommendations: 3,
+    allowFloorPlan: false,
+  },
+  detailed: {
+    maxRooms: 10,
+    maxIssues: 8,
+    maxRecommendations: 5,
+    allowFloorPlan: false,
+  },
+  floorplan: {
+    maxRooms: 100,
+    maxIssues: 10,
+    maxRecommendations: 10,
+    allowFloorPlan: true,
+  },
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PROMPT BUILDERS
+// ═══════════════════════════════════════════════════════════════════════════════
 
 function buildFreePrompt(roomData) {
   const rooms = [
@@ -166,19 +233,96 @@ Return ONLY a valid JSON object. Schema:
 Be extremely specific about what you see in the floor plan. Mention exact rooms, their positions, and precise Vastu violations or compliances.`;
 }
 
-// ═══════════════════════════════════════════════════════════════
-// POST /api/analyze
-// ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
+// ENFORCE PLAN LIMITS - Trim results based on plan type
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function enforcePlanLimits(result, planType) {
+  const limits = PLAN_LIMITS[planType] || PLAN_LIMITS.free;
+
+  // Enforce room limit
+  if (result.rooms && Array.isArray(result.rooms)) {
+    result.rooms = result.rooms.slice(0, limits.maxRooms);
+  }
+
+  // Enforce issue limit
+  if (result.issues && Array.isArray(result.issues)) {
+    result.issues = result.issues.slice(0, limits.maxIssues);
+  }
+
+  // Enforce recommendation limit
+  if (result.recommendations && Array.isArray(result.recommendations)) {
+    result.recommendations = result.recommendations.slice(0, limits.maxRecommendations);
+  }
+
+  // Add watermark for free plan
+  if (planType === 'free') {
+    result.planType = 'free';
+    result.limitation = 'Free Trial - Limited to 3 rooms. Upgrade for full analysis.';
+  }
+
+  return result;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// POST /api/analyze - WITH PAYMENT VERIFICATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
 app.post('/api/analyze', async (req, res) => {
-  const { planType, roomData, base64, mimeType } = req.body;
+  const { planType, roomData, base64, mimeType, purchaseToken, packageName, productId } = req.body;
 
   if (!planType) return res.status(400).json({ success: false, error: 'Missing planType' });
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // PAYMENT CHECK - Verify user has paid (unless free trial)
+  // ════════════════════════════════════════════════════════════════════════════
+  
+  if (planType !== 'free') {
+    // For paid plans, verify purchase
+    if (!purchaseToken || !productId || !packageName) {
+      return res.status(403).json({ 
+        success: false, 
+        error: 'Payment verification failed. Please verify your purchase.' 
+      });
+    }
+
+    const verification = await verifyPurchaseValid(productId, purchaseToken, packageName);
+    
+    if (!verification.isPaid) {
+      return res.status(403).json({ 
+        success: false, 
+        error: 'Your purchase could not be verified. Please try again or contact support.' 
+      });
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // PROCESS ANALYSIS
+  // ════════════════════════════════════════════════════════════════════════════
 
   let messages;
   let prompt;
 
   if (planType === 'floorplan') {
     if (!base64 || !mimeType) return res.status(400).json({ success: false, error: 'Missing floor plan file' });
+    
+    // Floor plan only available for paid plan
+    if (!PLAN_LIMITS.floorplan.allowFloorPlan) {
+      return res.status(403).json({ 
+        success: false, 
+        error: 'Floor plan analysis requires the Floor Plan package.' 
+      });
+    }
+
+    const sizeInBytes = base64.length * 0.75;
+    const sizeInMB = sizeInBytes / (1024 * 1024);
+    if (sizeInMB > 5) {
+      return res.status(413).json({ 
+        success: false, 
+        error: `File too large (${sizeInMB.toFixed(1)}MB). Maximum: 5MB.` 
+      });
+    }
+    
     const isPDF = mimeType === 'application/pdf';
     const filePart = isPDF
       ? { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: base64 } }
@@ -207,38 +351,35 @@ app.post('/api/analyze', async (req, res) => {
 
     const raw = response.content.filter(b => b.type === 'text').map(b => b.text).join('').trim();
 
-    // Try to parse JSON with multiple strategies
     let parsed;
-    
-    // Strategy 1: Direct parse
     try {
       parsed = JSON.parse(raw);
     } catch {
-      // Strategy 2: Remove markdown fences
       try {
         const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
         parsed = JSON.parse(cleaned);
       } catch {
-        // Strategy 3: Extract JSON object from text
         const match = raw.match(/\{[\s\S]*\}/);
-        if (!match) {
-          throw new Error('No JSON found in response');
-        }
+        if (!match) throw new Error('No JSON found');
         
         try {
           parsed = JSON.parse(match[0]);
         } catch {
-          // Strategy 4: Fix common JSON issues
           let fixed = match[0]
-            .replace(/,\s*\]/g, ']')  // Remove trailing commas in arrays
-            .replace(/,\s*\}/g, '}')  // Remove trailing commas in objects
-            .replace(/:\s*undefined/g, ': null')  // Fix undefined values
-            .replace(/:\s*NaN/g, ': 0');  // Fix NaN values
-          
+            .replace(/,\s*\]/g, ']')
+            .replace(/,\s*\}/g, '}')
+            .replace(/:\s*undefined/g, ': null')
+            .replace(/:\s*NaN/g, ': 0');
           parsed = JSON.parse(fixed);
         }
       }
     }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // ENFORCE PLAN LIMITS - This is the KEY FIX!
+    // ════════════════════════════════════════════════════════════════════════
+    
+    parsed = enforcePlanLimits(parsed, planType);
 
     res.json({ success: true, result: parsed });
   } catch (err) {
@@ -247,9 +388,10 @@ app.post('/api/analyze', async (req, res) => {
   }
 });
 
-// ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
 // POST /api/verify-purchase
-// ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
+
 app.post('/api/verify-purchase', async (req, res) => {
   const { productId, purchaseToken, packageName } = req.body;
   if (!productId || !purchaseToken || !packageName) {
